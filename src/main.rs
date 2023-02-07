@@ -302,7 +302,9 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                 let e = e
                     .title(format!("**{}**", target_user.name))
                     .color(0x7598ff)
-                    .field("Intro", intro_msg.content.clone(), false);
+                    .field("Intro", intro_msg.content.clone() + &format!("\n_[link]({})_", intro_msg.link()), false);
+                // TODO: technically we should markdown escape the intro_msg.content value before
+                // embedding it since embedding supports markdown, but content is plaintext
                 if let Some(url) = target_user.avatar_url() {
                     e.thumbnail(url)
                 } else {
@@ -332,7 +334,7 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     // we got an error telling us the embed was too long, give it another go as a normal
     // message
     if is_too_long {
-        msg.channel_id.send_message(ctx, |mut cm| {
+        if let Err(e) = msg.channel_id.send_message(ctx, |mut cm| {
             if let Some(avatar) = target_user.avatar_url() {
                 cm = cm.add_file(
                     serenity::model::channel::AttachmentType::Image(
@@ -340,11 +342,21 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                     )
                 )
             };
-            cm.content(format!(r#"**{}**
----------------------------------------
+            let mut msg = format!(r#"**{}**
+
 {}
----------------------------------------"#, target_user.name, intro_msg.content))
-        }).await?;
+"#, target_user.name, intro_msg.content);
+            // For embeds, discord limits us to 1024.
+            // For content like this, we're limited to about 2k, but we want to leave some space
+            // for the avatar, so go a bit shorter. This works in practice.
+            if msg.len() > 1950 {
+                msg.truncate(1950);
+                msg += " *truncated*";
+            }
+            cm.content(msg)
+        }).await {
+            error!("error sending long message: {}", e);
+        }
     }
 
     Ok(())
