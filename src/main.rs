@@ -26,21 +26,64 @@ struct IntroState {
 
 impl IntroState {
     async fn get_user_by_displayname(
-        &self,
+        &mut self,
         ctx: impl CacheHttp,
+        guild_id: GuildId,
         name: &str,
     ) -> serenity::Result<Option<User>> {
-        let id = match self.displaynames.get_by_left(name) {
-            None => return Ok(None),
-            Some(id) => id,
-        };
-        if let Some(c) = ctx.cache() {
-            if let Some(u) = c.user(id) {
-                return Ok(Some(u));
+        for try_refresh in [false, true] {
+            // otherwise, not in the cache, try and find em
+            if try_refresh {
+                // second try, refresh first, then try the same thing
+                self.refresh_intro_channel(&ctx, guild_id).await?;
+            }
+            if let Some(id) = self.displaynames.get_by_left(name) {
+                if let Some(c) = ctx.cache() {
+                    if let Some(u) = c.user(id) {
+                        return Ok(Some(u));
+                    }
+                }
+                return ctx.http().get_user(*id.as_u64()).await.map(Some);
             }
         }
-        ctx.http().get_user(*id.as_u64()).await.map(Some)
+        Ok(None)
     }
+
+    async fn refresh_intro_channel(
+        &mut self,
+        ctx: impl CacheHttp,
+        guild_id: GuildId,
+    ) -> serenity::Result<bool> {
+        let channels = ctx.http().get_channels(*guild_id.as_u64()).await?;
+        let intro_channel = match channels
+            .iter()
+            .find(|el| el.name == "introductions")
+            .cloned()
+        {
+            None => return Ok(false),
+            Some(c) => c,
+        };
+        // Otherwise, we have an intro channel which was not cached. Populate the full list of
+        // intros before caching it.
+        let mut messages = intro_channel.id.messages_iter(ctx.http()).boxed();
+        while let Some(msgr) = messages.next().await {
+            let msg = msgr?;
+            let nick = msg.author.nick_in(&ctx, guild_id).await.unwrap_or(msg.author.name.clone());
+            if !self.displaynames.contains_left(&nick) {
+                self.displaynames
+                    .insert(nick, msg.author.id);
+            }
+            self.intros.entry(msg.author.id).or_insert(msg);
+        }
+
+        debug!(
+            "got intro channel for guild {}: {}",
+            guild_id, intro_channel
+        );
+        self.intro_channel = Some(intro_channel.id);
+        Ok(true)
+    }
+
 
     async fn get_intro_channel(
         &mut self,
@@ -232,7 +275,7 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             msg.mentions.first().unwrap().clone()
         } else {
             let arg = args.remains().unwrap();
-            match state.get_user_by_displayname(ctx, arg).await? {
+            match state.get_user_by_displayname(ctx, guild_id, arg).await? {
                 None => {
                     if let Err(e) = msg
                         .reply(ctx, format!("no user with display name {arg}"))
