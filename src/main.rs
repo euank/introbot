@@ -242,8 +242,8 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
 
     let data = ctx.data.read().await;
     let rwl = data.get::<State>().unwrap().clone();
-    let all_state = rwl.read().await;
-    let state = match all_state.get(&guild_id) {
+    let mut all_state = rwl.write().await;
+    let state: &mut IntroState = match all_state.get_mut(&guild_id) {
         None => return Ok(()),
         Some(s) => s,
     };
@@ -282,6 +282,18 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         Some(intro_msg) => {
             intro_msg
         }
+    };
+    let intro_msg = match state.get_intro_message(ctx, guild_id, intro_msg.id).await? {
+        None => {
+            if let Err(e) = msg
+                .reply(ctx, format!("intro seems to have vanished for {}", target_user.name))
+                .await
+            {
+                error!("error replying: {:?}", e);
+            }
+            return Ok(());
+        },
+        Some(m) => m,
     };
     let is_too_long = match msg
         .channel_id
