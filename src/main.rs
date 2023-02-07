@@ -65,9 +65,10 @@ impl IntroState {
         let mut messages = intro_channel.id.messages_iter(ctx.http()).boxed();
         while let Some(msgr) = messages.next().await {
             let msg = msgr?;
-            if !self.displaynames.contains_left(&msg.author.name) {
+            let nick = msg.author.nick_in(&ctx, guild_id).await.unwrap_or(msg.author.name.clone());
+            if !self.displaynames.contains_left(&nick) {
                 self.displaynames
-                    .insert(msg.author.name.clone(), msg.author.id);
+                    .insert(nick, msg.author.id);
             }
             self.intros.entry(msg.author.id).or_insert(msg);
         }
@@ -112,29 +113,6 @@ struct Handler;
 
 #[async_trait]
 impl EventHandler for Handler {
-    async fn presence_update(&self, ctx: Context, pres: Presence) {
-        if let (Some(guild_id), Some(name)) = (pres.guild_id, pres.user.name) {
-            // possible update to displayname
-            let data = ctx.data.read().await;
-            let rwl = data.get::<State>().unwrap().clone();
-            let mut all_state = rwl.write().await;
-            let state = all_state.entry(guild_id).or_insert(Default::default());
-
-            let old_name = state.displaynames.get_by_right(&pres.user.id).cloned();
-
-            match old_name {
-                None => {
-                    state.displaynames.insert(name, pres.user.id);
-                }
-                Some(old_name) if old_name != name => {
-                    state.displaynames.remove_by_left(&old_name);
-                    state.displaynames.insert(name, pres.user.id);
-                }
-                Some(_) => {}
-            }
-        }
-    }
-
     async fn message(&self, ctx: Context, msg: Message) {
         if msg.author.id == ctx.cache.current_user_id() {
             // ignore ourselves
@@ -167,7 +145,7 @@ impl EventHandler for Handler {
             == Some(msg.channel_id)
         {
             state.intros.insert(msg.author.id, msg.clone());
-            state.displaynames.insert(msg.author.name, msg.author.id);
+            state.displaynames.insert(msg.author.nick_in(&ctx, guild_id).await.unwrap_or(msg.author.name), msg.author.id);
         }
     }
 
@@ -269,6 +247,7 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         }
     };
 
+    let nick = target_user.nick_in(&ctx, guild_id).await.unwrap_or(target_user.name.clone());
     let intro_msg = match state.intros.get(&target_user.id) {
         None => {
             if let Err(e) = msg
@@ -286,7 +265,7 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let intro_msg = match state.get_intro_message(ctx, guild_id, intro_msg.id).await? {
         None => {
             if let Err(e) = msg
-                .reply(ctx, format!("intro seems to have vanished for {}", target_user.name))
+                .reply(ctx, format!("intro seems to have vanished for {nick}"))
                 .await
             {
                 error!("error replying: {:?}", e);
@@ -298,9 +277,9 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let is_too_long = match msg
         .channel_id
         .send_message(ctx, |m| {
-            m.content(format!("**{}**", target_user.name)).embed(|e| {
+            m.content(format!("**{nick}**")).embed(|e| {
                 let e = e
-                    .title(format!("**{}**", target_user.name))
+                    .title(format!("**{nick}**"))
                     .color(0x7598ff)
                     .field("Intro", intro_msg.content.clone() + &format!("\n_[link]({})_", intro_msg.link()), false);
                 // TODO: technically we should markdown escape the intro_msg.content value before
@@ -353,9 +332,9 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                     )
                 )
             };
-            let mut msg = format!(r#"**{}**
+            let mut msg = format!(r#"**{nick}**
 {}
-"#, target_user.name, intro_msg.content);
+"#, intro_msg.content);
             // For embeds, discord limits us to 1024.
             // For content like this, we're limited to about 2k, but we want to leave some space
             // for the avatar, so go a bit shorter. This works in practice.
