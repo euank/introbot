@@ -336,14 +336,24 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     if is_too_long {
         if let Err(e) = msg.channel_id.send_message(ctx, |mut cm| {
             if let Some(avatar) = target_user.avatar_url() {
+                let avatar_url: url::Url = avatar.parse().unwrap();
+                let old_pairs = avatar_url.query_pairs().filter(|p| p.0 != "size").collect::<Vec<_>>();
+                let mut new_avatar_url = avatar_url.clone();
+                {
+                    let mut qm = new_avatar_url.query_pairs_mut();
+                    qm.clear();
+                    for (k, v) in old_pairs {
+                        qm.append_pair(&k, &v);
+                    }
+                    qm.append_pair("size", "72");
+                }
                 cm = cm.add_file(
                     serenity::model::channel::AttachmentType::Image(
-                        avatar.parse().unwrap()
+                        new_avatar_url,
                     )
                 )
             };
             let mut msg = format!(r#"**{}**
-
 {}
 "#, target_user.name, intro_msg.content);
             // For embeds, discord limits us to 1024.
