@@ -11,7 +11,7 @@ use serenity::framework::standard::{Args, CommandResult, StandardFramework};
 use serenity::futures::StreamExt;
 use serenity::http::CacheHttp;
 use serenity::model::channel::Message;
-use serenity::model::gateway::{Presence, Ready};
+use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, GuildId, UserId, MessageId};
 use serenity::model::user::User;
 use serenity::prelude::*;
