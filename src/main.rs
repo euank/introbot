@@ -320,11 +320,11 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let is_too_long = match msg
         .channel_id
         .send_message(ctx, |m| {
-            m.content(format!("**{nick}**")).embed(|e| {
+            m.embed(|e| {
                 let e = e
                     .title(format!("**{nick}**"))
                     .color(0x7598ff)
-                    .field("Intro", intro_msg.content.clone() + &format!("\n_[link]({})_", intro_msg.link()), false);
+                    .description(&format!("**Intro**\n{}\n_[link]({})_", intro_msg.content.clone(), intro_msg.link()));
                 // TODO: technically we should markdown escape the intro_msg.content value before
                 // embedding it since embedding supports markdown, but content is plaintext
                 if let Some(url) = target_user.avatar_url() {
