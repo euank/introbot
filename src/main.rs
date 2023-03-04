@@ -333,12 +333,8 @@ impl RawEventHandler for RawHandler {
                     .clone()
             };
 
-           let is_intro = s
-                .get_intro_channel(&ctx, guild_id)
-                .await
-                .unwrap_or(None)
-                == channel_id;
-           (is_intro, Some(s))
+            let is_intro = s.get_intro_channel(&ctx, guild_id).await.unwrap_or(None) == channel_id;
+            (is_intro, Some(s))
         } else {
             (false, None)
         };
