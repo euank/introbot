@@ -344,10 +344,7 @@ async fn main() {
         .configure(|c| c.with_whitespace(true).prefix("!"))
         .group(&GENERAL_GROUP);
 
-    let intents = GatewayIntents::GUILD_MESSAGES
-        | GatewayIntents::DIRECT_MESSAGES
-        | GatewayIntents::MESSAGE_CONTENT
-        | GatewayIntents::GUILD_PRESENCES;
+    let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
 
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler {
