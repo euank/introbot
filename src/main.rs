@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::env;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use bimap::BiMap;
 use tracing::{debug, error};
@@ -13,7 +15,7 @@ use serenity::http::CacheHttp;
 use serenity::model::channel::Message;
 use serenity::model::event::Event;
 use serenity::model::gateway::Ready;
-use serenity::model::id::{ChannelId, GuildId, UserId, MessageId};
+use serenity::model::id::{ChannelId, GuildId, MessageId, UserId};
 use serenity::model::user::User;
 use serenity::prelude::*;
 use tokio::sync::RwLock;
@@ -29,23 +31,15 @@ impl IntroState {
     async fn get_user_by_displayname(
         &mut self,
         ctx: impl CacheHttp,
-        guild_id: GuildId,
         name: &str,
     ) -> serenity::Result<Option<User>> {
-        for try_refresh in [false, true] {
-            // otherwise, not in the cache, try and find em
-            if try_refresh {
-                // second try, refresh first, then try the same thing
-                self.refresh_intro_channel(&ctx, guild_id).await?;
-            }
-            if let Some(id) = self.displaynames.get_by_left(name) {
-                if let Some(c) = ctx.cache() {
-                    if let Some(u) = c.user(id) {
-                        return Ok(Some(u));
-                    }
+        if let Some(id) = self.displaynames.get_by_left(&name.to_lowercase()) {
+            if let Some(c) = ctx.cache() {
+                if let Some(u) = c.user(id) {
+                    return Ok(Some(u));
                 }
-                return ctx.http().get_user(*id.as_u64()).await.map(Some);
             }
+            return ctx.http().get_user(*id.as_u64()).await.map(Some);
         }
         Ok(None)
     }
@@ -69,10 +63,13 @@ impl IntroState {
         let mut messages = intro_channel.id.messages_iter(ctx.http()).boxed();
         while let Some(msgr) = messages.next().await {
             let msg = msgr?;
-            let nick = msg.author.nick_in(&ctx, guild_id).await.unwrap_or(msg.author.name.clone());
-            if !self.displaynames.contains_left(&nick) {
-                self.displaynames
-                    .insert(nick, msg.author.id);
+            let nick = msg
+                .author
+                .nick_in(&ctx, guild_id)
+                .await
+                .unwrap_or(msg.author.name.clone());
+            if !self.displaynames.contains_left(&nick.to_lowercase()) {
+                self.displaynames.insert(nick.to_lowercase(), msg.author.id);
             }
             self.intros.entry(msg.author.id).or_insert(msg);
         }
@@ -84,7 +81,6 @@ impl IntroState {
         self.intro_channel = Some(intro_channel.id);
         Ok(true)
     }
-
 
     async fn get_intro_channel(
         &mut self,
@@ -109,10 +105,13 @@ impl IntroState {
         let mut messages = intro_channel.id.messages_iter(ctx.http()).boxed();
         while let Some(msgr) = messages.next().await {
             let msg = msgr?;
-            let nick = msg.author.nick_in(&ctx, guild_id).await.unwrap_or(msg.author.name.clone());
-            if !self.displaynames.contains_left(&nick) {
-                self.displaynames
-                    .insert(nick, msg.author.id);
+            let nick = msg
+                .author
+                .nick_in(&ctx, guild_id)
+                .await
+                .unwrap_or(msg.author.name.clone());
+            if !self.displaynames.contains_left(&nick.to_lowercase()) {
+                self.displaynames.insert(nick.to_lowercase(), msg.author.id);
             }
             self.intros.entry(msg.author.id).or_insert(msg);
         }
@@ -125,7 +124,12 @@ impl IntroState {
         Ok(self.intro_channel)
     }
 
-    async fn get_intro_message(&mut self, ctx: &impl CacheHttp, guild_id: GuildId, msg_id: MessageId) -> serenity::Result<Option<Message>> {
+    async fn get_intro_message(
+        &mut self,
+        ctx: &impl CacheHttp,
+        guild_id: GuildId,
+        msg_id: MessageId,
+    ) -> serenity::Result<Option<Message>> {
         let chan = match self.get_intro_channel(ctx, guild_id).await? {
             None => return Ok(None),
             Some(c) => c,
@@ -153,7 +157,9 @@ impl TypeMapKey for State {
 #[commands(intro)]
 struct General;
 
-struct Handler;
+struct Handler {
+    is_loop_running: AtomicBool,
+}
 
 #[async_trait]
 impl EventHandler for Handler {
@@ -189,12 +195,25 @@ impl EventHandler for Handler {
             == Some(msg.channel_id)
         {
             state.intros.insert(msg.author.id, msg.clone());
-            state.displaynames.insert(msg.author.nick_in(&ctx, guild_id).await.unwrap_or(msg.author.name), msg.author.id);
+            state.displaynames.insert(
+                msg.author
+                    .nick_in(&ctx, guild_id)
+                    .await
+                    .unwrap_or(msg.author.name)
+                    .to_lowercase(),
+                msg.author.id,
+            );
         }
     }
 
     // The below all update the serenity cache. TODO: this could be way more DRY
-    async fn message_update(&self, ctx: Context, _: Option<Message>, _: Option<Message>, mut update: serenity::model::event::MessageUpdateEvent) {
+    async fn message_update(
+        &self,
+        ctx: Context,
+        _: Option<Message>,
+        _: Option<Message>,
+        mut update: serenity::model::event::MessageUpdateEvent,
+    ) {
         let guild_id = match update.guild_id {
             None => {
                 debug!("message with no guild_id");
@@ -219,8 +238,42 @@ impl EventHandler for Handler {
         }
     }
 
-    async fn ready(&self, _: Context, ready: Ready) {
+    async fn ready(&self, ctx: Context, ready: Ready) {
         println!("{} is connected!", ready.user.name);
+        // Sleep to give the cache time to ready up this below
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let ctx = Arc::new(ctx);
+        if !self.is_loop_running.load(Ordering::Relaxed) {
+            let ctx = Arc::clone(&ctx);
+            tokio::spawn(async move {
+                loop {
+                    // update each guild, basically initialize the username caches
+                    // TODO: pagination, we're doing 100 now because we're only in 2 so who cares
+                    // right
+                    let guilds = match ctx.http.get_guilds(None, Some(100)).await {
+                        Err(e) => {
+                            error!("error getting guilds: {:?}", e);
+                            tokio::time::sleep(Duration::from_secs(120)).await;
+                            continue;
+                        }
+                        Ok(g) => g,
+                    };
+                    for guild in guilds {
+                        let data = ctx.data.write().await;
+                        let rwl = data.get::<State>().unwrap().clone();
+                        let mut all_state = rwl.write().await;
+                        let state = all_state.entry(guild.id).or_insert(Default::default());
+                        if let Err(e) = state.refresh_intro_channel(&ctx, guild.id).await {
+                            error!("error: {}", e);
+                        }
+                    }
+                    debug!("updated guild intro caches");
+                    tokio::time::sleep(Duration::from_secs(600)).await;
+                }
+            });
+            self.is_loop_running.swap(true, Ordering::Relaxed);
+        }
     }
 }
 
@@ -245,14 +298,19 @@ impl RawEventHandler for RawHandler {
 
         // cache messages, but only:
         // 1. In the intro channel, or 2. for username info so we can track usernames
-        if state.get_intro_channel(&ctx, guild_id).await.unwrap_or(None) != channel_id {
+        if state
+            .get_intro_channel(&ctx, guild_id)
+            .await
+            .unwrap_or(None)
+            != channel_id
+        {
             match ev {
                 serenity::model::event::Event::MessageCreate(mut ev) => {
                     ctx.cache.update(&mut ev);
-                },
+                }
                 serenity::model::event::Event::MessageUpdate(mut ev) => {
                     ctx.cache.update(&mut ev);
-                },
+                }
                 _ => return,
             };
             return;
@@ -274,7 +332,6 @@ impl RawEventHandler for RawHandler {
             }
             _ => return,
         }
-
     }
 }
 
@@ -293,7 +350,9 @@ async fn main() {
         | GatewayIntents::GUILD_PRESENCES;
 
     let mut client = Client::builder(&token, intents)
-        .event_handler(Handler)
+        .event_handler(Handler {
+            is_loop_running: AtomicBool::new(false),
+        })
         .raw_event_handler(RawHandler)
         .framework(framework)
         // 3000, but we also manually update for the introductions channel specifically
@@ -358,7 +417,7 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             msg.mentions.first().unwrap().clone()
         } else {
             let arg = args.remains().unwrap();
-            match state.get_user_by_displayname(ctx, guild_id, arg).await? {
+            match state.get_user_by_displayname(ctx, arg).await? {
                 None => {
                     if let Err(e) = msg
                         .reply(ctx, format!("no user with display name {arg}"))
@@ -373,7 +432,10 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         }
     };
 
-    let nick = target_user.nick_in(&ctx, guild_id).await.unwrap_or(target_user.name.clone());
+    let nick = target_user
+        .nick_in(&ctx, guild_id)
+        .await
+        .unwrap_or(target_user.name.clone());
     let intro_msg = match state.intros.get(&target_user.id) {
         None => {
             if let Err(e) = msg
@@ -384,9 +446,7 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
             }
             return Ok(());
         }
-        Some(intro_msg) => {
-            intro_msg
-        }
+        Some(intro_msg) => intro_msg,
     };
     let intro_msg = match state.get_intro_message(ctx, guild_id, intro_msg.id).await? {
         None => {
@@ -397,7 +457,7 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                 error!("error replying: {:?}", e);
             }
             return Ok(());
-        },
+        }
         Some(m) => m,
     };
     let is_too_long = match msg
@@ -407,7 +467,11 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                 let e = e
                     .title(format!("**{nick}**"))
                     .color(0x7598ff)
-                    .description(&format!("**Intro**\n{}\n_[link]({})_", intro_msg.content.clone(), intro_msg.link()));
+                    .description(&format!(
+                        "**Intro**\n{}\n_[link]({})_",
+                        intro_msg.content.clone(),
+                        intro_msg.link()
+                    ));
                 // TODO: technically we should markdown escape the intro_msg.content value before
                 // embedding it since embedding supports markdown, but content is plaintext
                 if let Some(url) = target_user.avatar_url() {
@@ -419,57 +483,65 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         })
         .await
     {
-        Err(SerenityError::Http(e)) => {
-            match *e {
-                serenity::http::error::Error::UnsuccessfulRequest(e) => {
-                    e.error.errors.iter().any(|e| e.code == "BASE_TYPE_MAX_LENGTH")
-                },
-                _ => {
-                    error!("error sending: {:?}", e);
-                    return Ok(())
-                },
+        Err(SerenityError::Http(e)) => match *e {
+            serenity::http::error::Error::UnsuccessfulRequest(e) => e
+                .error
+                .errors
+                .iter()
+                .any(|e| e.code == "BASE_TYPE_MAX_LENGTH"),
+            _ => {
+                error!("error sending: {:?}", e);
+                return Ok(());
             }
         },
         Err(e) => {
             error!("error sending: {:?}", e);
-            return Ok(())
+            return Ok(());
         }
         Ok(_) => false,
     };
     // we got an error telling us the embed was too long, give it another go as a normal
     // message
     if is_too_long {
-        if let Err(e) = msg.channel_id.send_message(ctx, |mut cm| {
-            if let Some(avatar) = target_user.avatar_url() {
-                let avatar_url: url::Url = avatar.parse().unwrap();
-                let old_pairs = avatar_url.query_pairs().filter(|p| p.0 != "size").collect::<Vec<_>>();
-                let mut new_avatar_url = avatar_url.clone();
-                {
-                    let mut qm = new_avatar_url.query_pairs_mut();
-                    qm.clear();
-                    for (k, v) in old_pairs {
-                        qm.append_pair(&k, &v);
+        if let Err(e) = msg
+            .channel_id
+            .send_message(ctx, |mut cm| {
+                if let Some(avatar) = target_user.avatar_url() {
+                    let avatar_url: url::Url = avatar.parse().unwrap();
+                    let old_pairs = avatar_url
+                        .query_pairs()
+                        .filter(|p| p.0 != "size")
+                        .collect::<Vec<_>>();
+                    let mut new_avatar_url = avatar_url.clone();
+                    {
+                        let mut qm = new_avatar_url.query_pairs_mut();
+                        qm.clear();
+                        for (k, v) in old_pairs {
+                            qm.append_pair(&k, &v);
+                        }
+                        qm.append_pair("size", "72");
                     }
-                    qm.append_pair("size", "72");
-                }
-                cm = cm.add_file(
-                    serenity::model::channel::AttachmentType::Image(
+                    cm = cm.add_file(serenity::model::channel::AttachmentType::Image(
                         new_avatar_url,
-                    )
-                )
-            };
-            let mut msg = format!(r#"**{nick}**
+                    ))
+                };
+                let mut msg = format!(
+                    r#"**{nick}**
 {}
-"#, intro_msg.content);
-            // For embeds, discord limits us to 1024.
-            // For content like this, we're limited to about 2k, but we want to leave some space
-            // for the avatar, so go a bit shorter. This works in practice.
-            if msg.len() > 1950 {
-                msg.truncate(1950);
-                msg += " *truncated*";
-            }
-            cm.content(msg)
-        }).await {
+"#,
+                    intro_msg.content
+                );
+                // For embeds, discord limits us to 1024.
+                // For content like this, we're limited to about 2k, but we want to leave some space
+                // for the avatar, so go a bit shorter. This works in practice.
+                if msg.len() > 1950 {
+                    msg.truncate(1950);
+                    msg += " *truncated*";
+                }
+                cm.content(msg)
+            })
+            .await
+        {
             error!("error sending long message: {}", e);
         }
     }
