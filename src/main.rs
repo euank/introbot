@@ -22,18 +22,34 @@ use tokio::sync::RwLock;
 
 #[derive(Default, Debug)]
 struct IntroState {
-    intros: HashMap<UserId, Message>,
-    displaynames: BiMap<String, UserId>,
-    intro_channel: Option<ChannelId>,
+    intros: RwLock<HashMap<UserId, Message>>,
+    displaynames: RwLock<BiMap<String, UserId>>,
+    intro_channel: std::sync::atomic::AtomicU64,
 }
 
 impl IntroState {
+    async fn update_user(&self, u: User, nick: Option<String>) {
+        let mut l = self.displaynames.write().await;
+        let nick = nick.unwrap_or(u.name.clone()).to_lowercase();
+        if let Some(cur_nick) = l.get_by_right(&u.id) {
+            if cur_nick == &nick {
+                return;
+            }
+            // otherwise, update; delete then re-add below with the new nick
+            l.remove_by_right(&u.id);
+        }
+        l.insert(nick, u.id);
+    }
+
     async fn get_user_by_displayname(
-        &mut self,
+        &self,
         ctx: impl CacheHttp,
         name: &str,
     ) -> serenity::Result<Option<User>> {
-        if let Some(id) = self.displaynames.get_by_left(&name.to_lowercase()) {
+        if let Some(id) = {
+            let lock = self.displaynames.read().await;
+            lock.get_by_left(&name.to_lowercase()).cloned()
+        } {
             if let Some(c) = ctx.cache() {
                 if let Some(u) = c.user(id) {
                     return Ok(Some(u));
@@ -45,7 +61,7 @@ impl IntroState {
     }
 
     async fn refresh_intro_channel(
-        &mut self,
+        &self,
         ctx: impl CacheHttp,
         guild_id: GuildId,
     ) -> serenity::Result<bool> {
@@ -63,32 +79,50 @@ impl IntroState {
         let mut messages = intro_channel.id.messages_iter(ctx.http()).boxed();
         while let Some(msgr) = messages.next().await {
             let msg = msgr?;
-            let nick = msg
-                .author
-                .nick_in(&ctx, guild_id)
+            self.intros
+                .write()
                 .await
-                .unwrap_or(msg.author.name.clone());
-            if !self.displaynames.contains_left(&nick.to_lowercase()) {
-                self.displaynames.insert(nick.to_lowercase(), msg.author.id);
+                .entry(msg.author.id)
+                .or_insert(msg.clone());
+
+            if let Some(pm) = msg.member {
+                self.update_user(msg.author, pm.nick).await;
+            } else if !self
+                .displaynames
+                .read()
+                .await
+                .contains_right(&msg.author.id)
+            {
+                // displaynane is already there, assume it's up to date
+                let nick = msg
+                    .author
+                    .nick_in(&ctx, guild_id)
+                    .await
+                    .unwrap_or(msg.author.name.clone());
+                self.displaynames
+                    .write()
+                    .await
+                    .insert(nick.to_lowercase(), msg.author.id);
             }
-            self.intros.entry(msg.author.id).or_insert(msg);
         }
 
         debug!(
             "got intro channel for guild {}: {}",
             guild_id, intro_channel
         );
-        self.intro_channel = Some(intro_channel.id);
+        self.intro_channel
+            .store(*intro_channel.id.as_u64(), Ordering::Relaxed);
         Ok(true)
     }
 
     async fn get_intro_channel(
-        &mut self,
+        &self,
         ctx: impl CacheHttp,
         guild_id: GuildId,
     ) -> serenity::Result<Option<ChannelId>> {
-        if self.intro_channel.is_some() {
-            return Ok(self.intro_channel);
+        let c = self.intro_channel.load(Ordering::Relaxed);
+        if c != 0 {
+            return Ok(Some(ChannelId::from(c)));
         }
 
         let channels = ctx.http().get_channels(*guild_id.as_u64()).await?;
@@ -100,32 +134,19 @@ impl IntroState {
             None => return Ok(None),
             Some(c) => c,
         };
-        // Otherwise, we have an intro channel which was not cached. Populate the full list of
-        // intros before caching it.
-        let mut messages = intro_channel.id.messages_iter(ctx.http()).boxed();
-        while let Some(msgr) = messages.next().await {
-            let msg = msgr?;
-            let nick = msg
-                .author
-                .nick_in(&ctx, guild_id)
-                .await
-                .unwrap_or(msg.author.name.clone());
-            if !self.displaynames.contains_left(&nick.to_lowercase()) {
-                self.displaynames.insert(nick.to_lowercase(), msg.author.id);
-            }
-            self.intros.entry(msg.author.id).or_insert(msg);
-        }
+        self.refresh_intro_channel(&ctx, guild_id).await?;
 
         debug!(
             "got intro channel for guild {}: {}",
             guild_id, intro_channel
         );
-        self.intro_channel = Some(intro_channel.id);
-        Ok(self.intro_channel)
+        Ok(Some(ChannelId::from(
+            self.intro_channel.load(Ordering::Relaxed),
+        )))
     }
 
     async fn get_intro_message(
-        &mut self,
+        &self,
         ctx: &impl CacheHttp,
         guild_id: GuildId,
         msg_id: MessageId,
@@ -135,10 +156,8 @@ impl IntroState {
             Some(c) => c,
         };
 
-        if let Some(cache) = ctx.cache() {
-            if let Some(cached) = cache.message(chan, msg_id) {
-                return Ok(Some(cached));
-            }
+        if let Some(msg) = ctx.cache().and_then(|c| c.message(chan, msg_id)) {
+            return Ok(Some(msg));
         }
 
         // TODO: map not found to Ok(None)
@@ -150,7 +169,7 @@ impl IntroState {
 struct State;
 
 impl TypeMapKey for State {
-    type Value = Arc<RwLock<HashMap<GuildId, IntroState>>>;
+    type Value = Arc<RwLock<HashMap<GuildId, Arc<IntroState>>>>;
 }
 
 #[group]
@@ -182,10 +201,15 @@ impl EventHandler for Handler {
             }
             Some(id) => id,
         };
-        let data = ctx.data.write().await;
-        let rwl = data.get::<State>().unwrap().clone();
-        let mut all_state = rwl.write().await;
-        let state = all_state.entry(guild_id).or_insert(Default::default());
+        let state = {
+            let data = ctx.data.write().await;
+            let rwl = data.get::<State>().unwrap().clone();
+            let mut all_state = rwl.write().await;
+            all_state
+                .entry(guild_id)
+                .or_insert(Default::default())
+                .clone()
+        };
 
         // If it's an intro, save it
         if state
@@ -194,15 +218,11 @@ impl EventHandler for Handler {
             .unwrap_or(None)
             == Some(msg.channel_id)
         {
-            state.intros.insert(msg.author.id, msg.clone());
-            state.displaynames.insert(
-                msg.author
-                    .nick_in(&ctx, guild_id)
-                    .await
-                    .unwrap_or(msg.author.name)
-                    .to_lowercase(),
-                msg.author.id,
-            );
+            state
+                .intros
+                .write()
+                .await
+                .insert(msg.author.id, msg.clone());
         }
     }
 
@@ -222,10 +242,15 @@ impl EventHandler for Handler {
             Some(id) => id,
         };
 
-        let data = ctx.data.write().await;
-        let rwl = data.get::<State>().unwrap().clone();
-        let mut all_state = rwl.write().await;
-        let state = all_state.entry(guild_id).or_insert(Default::default());
+        let state = {
+            let data = ctx.data.write().await;
+            let rwl = data.get::<State>().unwrap().clone();
+            let mut all_state = rwl.write().await;
+            all_state
+                .entry(guild_id)
+                .or_insert(Default::default())
+                .clone()
+        };
 
         // cache intro messages
         if state
@@ -260,10 +285,15 @@ impl EventHandler for Handler {
                         Ok(g) => g,
                     };
                     for guild in guilds {
-                        let data = ctx.data.write().await;
-                        let rwl = data.get::<State>().unwrap().clone();
-                        let mut all_state = rwl.write().await;
-                        let state = all_state.entry(guild.id).or_insert(Default::default());
+                        let state = {
+                            let data = ctx.data.write().await;
+                            let rwl = data.get::<State>().unwrap().clone();
+                            let mut all_state = rwl.write().await;
+                            all_state
+                                .entry(guild.id)
+                                .or_insert(Default::default())
+                                .clone()
+                        };
                         if let Err(e) = state.refresh_intro_channel(&ctx, guild.id).await {
                             error!("error: {}", e);
                         }
@@ -282,52 +312,104 @@ struct RawHandler;
 #[async_trait]
 impl RawEventHandler for RawHandler {
     async fn raw_event(&self, ctx: Context, ev: serenity::model::event::Event) {
+        debug!("Raw event: {:?}", ev);
         let guild_id = match ev.guild_id() {
-            serenity::model::event::RelatedId::Some(id) => id,
-            _ => return,
+            serenity::model::event::RelatedId::Some(id) => Some(id),
+            _ => None,
         };
         let channel_id = match ev.channel_id() {
             serenity::model::event::RelatedId::Some(id) => Some(id),
             _ => None,
         };
 
-        let data = ctx.data.write().await;
-        let rwl = data.get::<State>().unwrap().clone();
-        let mut all_state = rwl.write().await;
-        let state = all_state.entry(guild_id).or_insert(Default::default());
-
-        // cache messages, but only:
-        // 1. In the intro channel, or 2. for username info so we can track usernames
-        if state
-            .get_intro_channel(&ctx, guild_id)
-            .await
-            .unwrap_or(None)
-            != channel_id
-        {
-            match ev {
-                serenity::model::event::Event::MessageCreate(mut ev) => {
-                    ctx.cache.update(&mut ev);
-                }
-                serenity::model::event::Event::MessageUpdate(mut ev) => {
-                    ctx.cache.update(&mut ev);
-                }
-                _ => return,
+        let (is_intro_channel, state) = if let Some(guild_id) = guild_id {
+            let s = {
+                let data = ctx.data.write().await;
+                let rwl = data.get::<State>().unwrap().clone();
+                let mut all_state = rwl.write().await;
+                all_state
+                    .entry(guild_id)
+                    .or_insert(Default::default())
+                    .clone()
             };
-            return;
-        }
 
-        // Otherwise, no channel ID, so it could be a username update
+           let is_intro = s
+                .get_intro_channel(&ctx, guild_id)
+                .await
+                .unwrap_or(None)
+                == channel_id;
+           (is_intro, Some(s))
+        } else {
+            (false, None)
+        };
+
+        // This could be DRY'd with a macro
         match ev {
-            Event::UserUpdate(mut ev) => {
+            // cache messages, but only:
+            // 1. In the intro channel, or 2. for username info so we can track usernames
+            Event::MessageCreate(mut ev) => {
+                if is_intro_channel {
+                    ctx.cache.update(&mut ev);
+                }
+            }
+            Event::MessageUpdate(mut ev) => {
+                if is_intro_channel {
+                    ctx.cache.update(&mut ev);
+                }
+            }
+            Event::ChannelCreate(mut ev) => {
                 ctx.cache.update(&mut ev);
             }
-            Event::GuildMemberAdd(mut ev) => {
+            Event::ChannelDelete(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::ChannelPinsUpdate(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::ChannelUpdate(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::GuildCreate(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::GuildDelete(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::GuildEmojisUpdate(mut ev) => {
                 ctx.cache.update(&mut ev);
             }
             Event::GuildMemberRemove(mut ev) => {
                 ctx.cache.update(&mut ev);
+                // TODO; delete em I guess? Idk
+            }
+            Event::GuildMemberAdd(mut ev) => {
+                ctx.cache.update(&mut ev);
+                if let Some(s) = state {
+                    s.update_user(ev.member.user, ev.member.nick).await;
+                }
             }
             Event::GuildMemberUpdate(mut ev) => {
+                ctx.cache.update(&mut ev);
+                if let Some(s) = state {
+                    s.update_user(ev.user, ev.nick).await;
+                }
+            }
+            Event::GuildMembersChunk(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::GuildUnavailable(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::GuildUpdate(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::PresenceUpdate(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::PresencesReplace(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::UserUpdate(mut ev) => {
                 ctx.cache.update(&mut ev);
             }
             _ => return,
@@ -344,7 +426,9 @@ async fn main() {
         .configure(|c| c.with_whitespace(true).prefix("!"))
         .group(&GENERAL_GROUP);
 
-    let intents = GatewayIntents::non_privileged() | GatewayIntents::MESSAGE_CONTENT;
+    let intents = GatewayIntents::non_privileged()
+        | GatewayIntents::MESSAGE_CONTENT
+        | GatewayIntents::GUILD_MEMBERS;
 
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler {
@@ -401,7 +485,7 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
     let data = ctx.data.read().await;
     let rwl = data.get::<State>().unwrap().clone();
     let mut all_state = rwl.write().await;
-    let state: &mut IntroState = match all_state.get_mut(&guild_id) {
+    let state: &IntroState = match all_state.get_mut(&guild_id) {
         None => return Ok(()),
         Some(s) => s,
     };
@@ -431,7 +515,7 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         .nick_in(&ctx, guild_id)
         .await
         .unwrap_or(target_user.name.clone());
-    let intro_msg = match state.intros.get(&target_user.id) {
+    let intro_msg = match state.intros.read().await.get(&target_user.id).cloned() {
         None => {
             if let Err(e) = msg
                 .reply(ctx, format!("no intro for {}", target_user.name))
