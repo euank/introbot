@@ -60,6 +60,7 @@ impl IntroState {
         Ok(None)
     }
 
+    // Refresh the intro channel, including finding it and storing its id.
     async fn refresh_intro_channel(
         &self,
         ctx: impl CacheHttp,
@@ -74,8 +75,6 @@ impl IntroState {
             None => return Ok(false),
             Some(c) => c,
         };
-        // Otherwise, we have an intro channel which was not cached. Populate the full list of
-        // intros before caching it.
         let mut messages = intro_channel.id.messages_iter(ctx.http()).boxed();
         while let Some(msgr) = messages.next().await {
             let msg = msgr?;
@@ -125,16 +124,9 @@ impl IntroState {
             return Ok(Some(ChannelId::from(c)));
         }
 
-        let channels = ctx.http().get_channels(*guild_id.as_u64()).await?;
-        let intro_channel = match channels
-            .iter()
-            .find(|el| el.name == "introductions")
-            .cloned()
-        {
-            None => return Ok(None),
-            Some(c) => c,
-        };
+        // Otherwise, do an initial refresh
         self.refresh_intro_channel(&ctx, guild_id).await?;
+        let intro_channel = self.intro_channel.load(Ordering::Relaxed);
 
         debug!(
             "got intro channel for guild {}: {}",
