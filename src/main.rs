@@ -352,8 +352,6 @@ async fn main() {
         })
         .raw_event_handler(RawHandler)
         .framework(framework)
-        // 3000, but we also manually update for the introductions channel specifically
-        .cache_settings(|s| s.max_messages(3000))
         .await
         .expect("Err creating client");
     {
