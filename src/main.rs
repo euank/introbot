@@ -1,3 +1,5 @@
+mod util;
+
 use std::collections::HashMap;
 use std::env;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -536,11 +538,9 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
                     .color(0x7598ff)
                     .description(&format!(
                         "**Intro**\n{}\n_[link]({})_",
-                        intro_msg.content.clone(),
+                        &util::escape_discord_markdown(&intro_msg.content),
                         intro_msg.link()
                     ));
-                // TODO: technically we should markdown escape the intro_msg.content value before
-                // embedding it since embedding supports markdown, but content is plaintext
                 if let Some(url) = target_user.avatar_url() {
                     e.thumbnail(url)
                 } else {
