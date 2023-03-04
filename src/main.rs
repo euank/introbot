@@ -11,6 +11,7 @@ use serenity::framework::standard::{Args, CommandResult, StandardFramework};
 use serenity::futures::StreamExt;
 use serenity::http::CacheHttp;
 use serenity::model::channel::Message;
+use serenity::model::event::Event;
 use serenity::model::gateway::Ready;
 use serenity::model::id::{ChannelId, GuildId, UserId, MessageId};
 use serenity::model::user::User;
@@ -192,8 +193,88 @@ impl EventHandler for Handler {
         }
     }
 
+    // The below all update the serenity cache. TODO: this could be way more DRY
+    async fn message_update(&self, ctx: Context, _: Option<Message>, _: Option<Message>, mut update: serenity::model::event::MessageUpdateEvent) {
+        let guild_id = match update.guild_id {
+            None => {
+                debug!("message with no guild_id");
+                return;
+            }
+            Some(id) => id,
+        };
+
+        let data = ctx.data.write().await;
+        let rwl = data.get::<State>().unwrap().clone();
+        let mut all_state = rwl.write().await;
+        let state = all_state.entry(guild_id).or_insert(Default::default());
+
+        // cache intro messages
+        if state
+            .get_intro_channel(&ctx, guild_id)
+            .await
+            .unwrap_or(None)
+            == Some(update.channel_id)
+        {
+            ctx.cache.update(&mut update);
+        }
+    }
+
     async fn ready(&self, _: Context, ready: Ready) {
         println!("{} is connected!", ready.user.name);
+    }
+}
+
+struct RawHandler;
+
+#[async_trait]
+impl RawEventHandler for RawHandler {
+    async fn raw_event(&self, ctx: Context, ev: serenity::model::event::Event) {
+        let guild_id = match ev.guild_id() {
+            serenity::model::event::RelatedId::Some(id) => id,
+            _ => return,
+        };
+        let channel_id = match ev.channel_id() {
+            serenity::model::event::RelatedId::Some(id) => Some(id),
+            _ => None,
+        };
+
+        let data = ctx.data.write().await;
+        let rwl = data.get::<State>().unwrap().clone();
+        let mut all_state = rwl.write().await;
+        let state = all_state.entry(guild_id).or_insert(Default::default());
+
+        // cache messages, but only:
+        // 1. In the intro channel, or 2. for username info so we can track usernames
+        if state.get_intro_channel(&ctx, guild_id).await.unwrap_or(None) != channel_id {
+            match ev {
+                serenity::model::event::Event::MessageCreate(mut ev) => {
+                    ctx.cache.update(&mut ev);
+                },
+                serenity::model::event::Event::MessageUpdate(mut ev) => {
+                    ctx.cache.update(&mut ev);
+                },
+                _ => return,
+            };
+            return;
+        }
+
+        // Otherwise, no channel ID, so it could be a username update
+        match ev {
+            Event::UserUpdate(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::GuildMemberAdd(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::GuildMemberRemove(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            Event::GuildMemberUpdate(mut ev) => {
+                ctx.cache.update(&mut ev);
+            }
+            _ => return,
+        }
+
     }
 }
 
@@ -213,10 +294,12 @@ async fn main() {
 
     let mut client = Client::builder(&token, intents)
         .event_handler(Handler)
+        .raw_event_handler(RawHandler)
         .framework(framework)
+        // 3000, but we also manually update for the introductions channel specifically
+        .cache_settings(|s| s.max_messages(3000))
         .await
         .expect("Err creating client");
-
     {
         // Open the data lock in write mode, so keys can be inserted to it.
         let mut data = client.data.write().await;
