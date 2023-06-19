@@ -500,8 +500,8 @@ impl RawEventHandler for RawHandler {
 }
 #[tokio::main]
 async fn main() {
-    // tracing_subscriber::fmt::init();
-    console_subscriber::init();
+    tracing_subscriber::fmt::init();
+    // console_subscriber::init();
     let token = env::var("DISCORD_TOKEN").expect("Expected a token in the environment");
 
     let framework = StandardFramework::new().group(&GENERAL_GROUP);
