@@ -620,15 +620,11 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         }
         Some(m) => m,
     };
-    debug!("intro raw: {}", intro_msg.content);
     let mut intro_embed = CreateEmbed::new()
         .title(format!("**{nick}**"))
         .color(0x7598ff)
-        .description(format!(
-            "**Intro**\n{}\n_[link]({})_",
-            &markdown::escape(&intro_msg.content),
-            intro_msg.link()
-        ));
+        .description(&intro_msg.content)
+        .field("", intro_msg.link(), true);
     if let Some(url) = target_user.avatar_url() {
         intro_embed = intro_embed.thumbnail(url);
     }
