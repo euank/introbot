@@ -1,4 +1,4 @@
-mod util;
+mod markdown;
 
 use std::collections::HashMap;
 use std::env;
@@ -620,12 +620,13 @@ async fn intro(ctx: &Context, msg: &Message, args: Args) -> CommandResult {
         }
         Some(m) => m,
     };
+    debug!("intro raw: {}", intro_msg.content);
     let mut intro_embed = CreateEmbed::new()
         .title(format!("**{nick}**"))
         .color(0x7598ff)
         .description(format!(
             "**Intro**\n{}\n_[link]({})_",
-            &util::escape_discord_markdown(&intro_msg.content),
+            &markdown::escape(&intro_msg.content),
             intro_msg.link()
         ));
     if let Some(url) = target_user.avatar_url() {
