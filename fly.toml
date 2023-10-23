@@ -1,16 +1,23 @@
-# fly.toml file generated for introbot on 2023-02-07T19:50:07+09:00
+# fly.toml app configuration file generated for introbot on 2023-10-24T00:11:52+09:00
+#
+# See https://fly.io/docs/reference/configuration/ for information about how to use this file.
+#
 
 app = "introbot"
+primary_region = "nrt"
 kill_signal = "SIGINT"
-kill_timeout = 5
-processes = []
-
-[env]
-  RUST_LOG = "debug"
+kill_timeout = "5s"
 
 [experimental]
   auto_rollback = true
 
+[env]
+  RUST_LOG = "debug"
+
+[processes]
+  app = ""
+
 [[services]]
-  processes = ["introbot"]
-  script_checks = []
+  protocol = ""
+  internal_port = 0
+  processes = ["app"]
